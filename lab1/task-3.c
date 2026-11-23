@@ -1,142 +1,126 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 
-// Структура, которая будет передаваться из потока в main
 typedef struct {
-    char *filename;       // имя файла (указатель на argv, менять не нужно)
+    char *filename;
     long line_count;
-    char *longest_line;   // строка (выделена через malloc)
-    int has_error;
-    char error_msg[256];  // сообщение об ошибке
-} ThreadResult;
+    char *longest_line;      
+    int has_error;           
+} FileResult;
 
 void *mythread(void *arg) {
-    // arg содержит имя файла
     char *fname = (char *)arg;
 
-    // Выделяем память под результат, который заберем в main
-    ThreadResult *res = malloc(sizeof(ThreadResult));
+    FileResult *res = malloc(sizeof(FileResult));
     if (!res) {
-        return NULL; // Не удалось выделить память даже под структуру
+        return NULL;
     }
 
     res->filename = fname;
     res->line_count = 0;
     res->longest_line = NULL;
     res->has_error = 0;
-    res->error_msg[0] = '\0';
 
     FILE *fd;
-    char buffer[4096];
+    char *buffer = NULL;
+    size_t capacity = 0;
+    ssize_t bytes_read;
     size_t max_len = 0;
-    char *current_longest = NULL;
+    char *cur_longest = NULL;
     long lines = 0;
 
     if ((fd = fopen(fname, "r")) == NULL) {
         res->has_error = 1;
-        snprintf(res->error_msg, sizeof(res->error_msg),
-                 "Cannot open file: %s (%s)", fname, strerror(errno));
+        fprintf(stderr, "Cant open %s\n", res->filename);
         return (void *)res;
     }
 
-    while (fgets(buffer, sizeof(buffer), fd) != NULL) {
+    while ((bytes_read = getline(&buffer, &capacity, fd)) != -1) {
         lines++;
-        size_t len = strlen(buffer);
+        size_t len = bytes_read;
 
-        // Убираем '\n'
         if (len > 0 && buffer[len - 1] == '\n') {
-            buffer[len - 1] = '\0';
             len--;
+            if (len > 0 && buffer[len - 1] == '\r') {
+                len--;
+            }
         }
 
-        // Ищем самую длинную (последнюю при равенстве)
         if (len >= max_len) {
-            max_len = len;
-            if (current_longest != NULL) {
-                free(current_longest);
-            }
-            current_longest = malloc(len + 1);
-            if (current_longest == NULL) {
+            char *longest = realloc(cur_longest, len + 1);
+            if (longest == NULL) {
                 res->has_error = 1;
-                snprintf(res->error_msg, sizeof(res->error_msg), "Memory allocation failed");
-                fclose(fd);
-                // Не забываем освободить то, что уже успели выделить
-                if (res->longest_line) free(res->longest_line); 
-                free(res);
-                return NULL;
+                fprintf(stderr, "Error malloc: %s\n", res->filename);
+                break;
             }
-            strcpy(current_longest, buffer);
+            cur_longest = longest;
+            memcpy(cur_longest, buffer, len);
+            cur_longest[len] = '\0';
+            max_len = len;
         }
     }
 
+    if (!res->has_error && (ferror(fd) || !feof(fd))) {
+        res->has_error = 1;
+        fprintf(stderr, "Cant read %s\n", res->filename);
+    }
+    free(buffer);
     fclose(fd);
 
     res->line_count = lines;
-    res->longest_line = current_longest;
-    return (void *)res; // Возвращаем указатель на структуру
+    res->longest_line = cur_longest;
+    return (void *)res; 
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s file1 [file2 ...]\n", argv[0]);
+     if (argc < 2) {
+        fprintf(stderr, "Error: no input files\n");
         return EXIT_FAILURE;
     }
-
-    int file_count = argc - 1;
-    pthread_t *threads = malloc(file_count * sizeof(pthread_t));
+    int status = 0;
+    int f_cnt = argc - 1;
+    pthread_t *threads = malloc(f_cnt * sizeof(pthread_t));
 
     if (!threads) {
-        fprintf(stderr, "Memory allocation failed\n");
+        fprintf(stderr, "Error malloc\n");
         return EXIT_FAILURE;
     }
 
-    // Создаем потоки. В качестве аргумента передаем просто имя файла (argv[i+1])
-    for (int i = 0; i < file_count; i++) {
+    for (int i = 0; i < f_cnt; i++) {
         int ret = pthread_create(&threads[i], NULL, mythread, (void *)argv[i + 1]);
         if (ret != 0) {
-            fprintf(stderr, "Error creating thread for file '%s'\n", argv[i + 1]);
-            free(threads);
-            return EXIT_FAILURE;
+            fprintf(stderr, "Error pthread_create: %s\n", argv[i + 1]);
+            status = EXIT_FAILURE;
+            break;
         }
-        printf("Thread created for file: %s\n", argv[i + 1]);
+        printf("Thread creat: %s | %ld\n", argv[i + 1], threads[i]);
     }
 
-    printf("\n--- Results ---\n");
+    printf("\n#Results \n");
+    for (int i = 0; i < f_cnt; i++) {
+        void *retval = NULL;
+        int ret = pthread_join(threads[i], &retval);
 
-    // Ждем завершения потоков и получаем результат через второй аргумент pthread_join
-    for (int i = 0; i < file_count; i++) {
-        void *retval;
-        pthread_join(threads[i], &retval);
-
-        if (!retval) {
-            // Поток вернул NULL (например, не хватило памяти под структуру)
-            printf("File: %s — Error: Failed to create result structure\n", argv[i + 1]);
-            continue;
-        }
-
-        ThreadResult *res = (ThreadResult *)retval;
+        FileResult *res = (FileResult *)retval;
 
         if (res->has_error) {
-            printf("File: %s — Error: %s\n", res->filename, res->error_msg);
+            status = EXIT_FAILURE;
         } else {
-            if (res->line_count == 0) {
-                printf("File: %s — Lines: 0, Longest line: (empty)\n", res->filename);
-            } else {
-                printf("File: %s — Lines: %ld, Longest line: \"%s\"\n",
-                       res->filename,
-                       res->line_count,
-                       res->longest_line);
-            }
+            printf("File: %s | lines: %ld | longest: '%s'\n", res->filename,  res->line_count, res->longest_line);      
         }
-
-        // Освобождаем память, выделенную внутри потока
         free(res->longest_line);
         free(res);
     }
 
+
+
+
+
     free(threads);
-    return 0;
+    return status;
 }
